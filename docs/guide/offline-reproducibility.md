@@ -92,6 +92,11 @@ digest. The checker never writes or repairs supplied evidence.
 Available artifact bindings are checked even when results or summary evidence
 is missing or empty. A missing summary withholds the numerical comparison but
 does not hide a known hash mismatch in the supplied results or manifest.
+Each available artifact is also parsed and validated independently. A missing
+or malformed manifest does not skip the other supplied files, and a summary
+with invalid fields fails even when results are unavailable or empty. Missing
+inputs withhold the aggregate comparison; known failures still take precedence
+over MISSING in the overall report.
 
 The report always includes the current Git HEAD and dirty state, the current
 scorer digest, the manifest's declared dataset revision, and artifact digests.

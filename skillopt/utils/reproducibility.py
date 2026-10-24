@@ -157,20 +157,31 @@ def audit(
     check("source", "PASS" if report["source_revision"] else "MISSING", "Current checkout SHA; not historical run SHA")
     scorer = Path(__file__).with_name("scoring.py")
     artifact(scorer, "scorer")
+    paths = {
+        "manifest": manifest_path, "evidence": evidence_path,
+        "results": results_path, "summary": summary_path,
+        **{name: manifest_path.parent / name / "items.json" for name in SPLIT_NAMES},
+    }
+    available = {label: path is not None and artifact(path, label) for label, path in paths.items()}
     split_ids: dict[str, list[str]] = {}
+    counts: dict[str, Any] = {}
+    manifest_valid = False
     try:
-        if not artifact(manifest_path, "manifest"):
-            return finish()
-        manifest = _object(manifest_path)
-        report["dataset_revision"] = manifest.get("source_revision")
-        check("dataset_revision", "PASS" if _present(manifest.get("source_revision")) else "MISSING", "Dataset revision declared by manifest; raw payload not verified")
-        counts = manifest.get("counts", {})
-        if not isinstance(counts, dict):
-            raise ValueError("manifest counts must be an object")
-        for name in SPLIT_NAMES:
-            path = manifest_path.parent / name / "items.json"
-            if not artifact(path, name):
-                continue
+        if available["manifest"]:
+            manifest = _object(manifest_path)
+            report["dataset_revision"] = manifest.get("source_revision")
+            check("dataset_revision", "PASS" if _present(manifest.get("source_revision")) else "MISSING", "Dataset revision declared by manifest; raw payload not verified")
+            if not isinstance(manifest.get("counts", {}), dict):
+                raise ValueError("manifest counts must be an object")
+            counts = manifest.get("counts", {})
+            manifest_valid = True
+    except (ValueError, OSError) as exc:
+        check("manifest", "FAIL", str(exc))
+    for name in SPLIT_NAMES:
+        if not available[name]:
+            continue
+        path = manifest_path.parent / name / "items.json"
+        try:
             rows = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(rows, list):
                 raise ValueError(f"{path}: expected a JSON array")
@@ -183,16 +194,16 @@ def audit(
             duplicates = sorted(key for key, count in Counter(ids).items() if count > 1)
             report["duplicates"][name] = duplicates
             check(f"duplicates:{name}", "FAIL" if duplicates else "PASS", f"{name}: {duplicates}")
-        for left, right in combinations(split_ids, 2):
-            overlap = sorted(set(split_ids[left]) & set(split_ids[right]))
-            report["overlaps"][f"{left}/{right}"] = overlap
-            check(f"overlap:{left}/{right}", "FAIL" if overlap else "PASS", f"{left}/{right}: {overlap}")
-    except (ValueError, OSError) as exc:
-        check("manifest", "FAIL", str(exc))
-        return finish()
+        except (ValueError, OSError) as exc:
+            check(name, "FAIL", str(exc))
+    for left, right in combinations(split_ids, 2):
+        overlap = sorted(set(split_ids[left]) & set(split_ids[right]))
+        report["overlaps"][f"{left}/{right}"] = overlap
+        check(f"overlap:{left}/{right}", "FAIL" if overlap else "PASS", f"{left}/{right}: {overlap}")
 
+    run_metadata = False
     try:
-        if evidence_path is not None and artifact(evidence_path, "evidence"):
+        if available["evidence"]:
             evidence = _object(evidence_path)
         kind = evidence.get("classification", "MISSING")
         origin = evidence.get("origin")
@@ -203,19 +214,47 @@ def audit(
         if kind == "RECONSTRUCTED" and origin not in ("synthetic", "reconstruction"):
             raise ValueError("RECONSTRUCTED requires origin synthetic or reconstruction")
         report["evidence"] = {"classification": kind, "origin": origin, "run_id": evidence.get("run_id"), "run_source_revision": evidence.get("source_revision")}
-        run_metadata = _present(evidence.get("run_id")) and _present(evidence.get("source_revision"))
+        run_metadata = kind != "MISSING" and _present(evidence.get("run_id")) and _present(evidence.get("source_revision"))
         historical = kind == "RECORDED" and origin == "historical" and run_metadata
         check("historical_evidence", "PASS" if historical else "MISSING", "Historical origin, run ID and source revision are user declarations; absent or reconstructed artifacts cannot verify a historical result")
         if kind != "MISSING":
             check("run_metadata", "PASS" if run_metadata else "MISSING", "Run ID and actual run source revision required")
     except (ValueError, OSError) as exc:
         check("evidence", "FAIL", str(exc))
-        return finish()
+
+    summary: dict[str, Any] = {}
+    summary_metadata = False
+    summary_values = False
+    if available["summary"]:
+        try:
+            summary = _object(summary_path)
+            n_items = summary.get("n_items")
+            summary_split = summary.get("split")
+            normalized_split = SPLITS.get(summary_split) if isinstance(summary_split, str) else None
+            valid_count = isinstance(n_items, int) and not isinstance(n_items, bool) and n_items >= 0
+            invalid_metadata = (
+                n_items is not None and not valid_count
+                or summary_split is not None and not isinstance(summary_split, str)
+                or normalized_split is not None and normalized_split != split
+            )
+            summary_metadata = valid_count and normalized_split == split
+            check("summary_metadata", "FAIL" if invalid_metadata else "PASS" if summary_metadata else "MISSING", f"n_items={n_items}, split={summary_split}")
+            summary_values = True
+            for metric in ("hard", "soft"):
+                value = summary.get(metric)
+                state = "MISSING" if value is None else "PASS" if _number(value) else "FAIL"
+                check(f"summary_values:{metric}", state, f"{metric}: reported={value}")
+                summary_values &= state == "PASS"
+        except (ValueError, OSError, OverflowError) as exc:
+            check("summary", "FAIL", str(exc))
+    else:
+        check("summary", "MISSING", "eval_summary.json unavailable; no reported-score comparison")
+
+    # All available bytes and provenance have been read before caching bindings.
+    bindings = check_bindings()
 
     try:
-        results_available = results_path is not None and artifact(results_path, "results")
-        summary_available = summary_path is not None and artifact(summary_path, "summary")
-        if not results_available:
+        if not available["results"]:
             check("per_item_results", "MISSING", "Per-item results.jsonl unavailable; no aggregate verdict")
             return finish()
         rows = [json.loads(line) for line in results_path.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -258,18 +297,8 @@ def audit(
             else:
                 check("aggregation_values", "FAIL", "Saved-score aggregation produced a nonfinite value")
                 complete = False
-        if not summary_available:
-            check("summary", "MISSING", "eval_summary.json unavailable; no reported-score comparison")
-            return finish()
-        summary = _object(summary_path)
-        bindings = check_bindings()
         n_items = summary.get("n_items")
-        summary_split = summary.get("split")
-        normalized_split = SPLITS.get(summary_split) if isinstance(summary_split, str) else None
-        summary_metadata = isinstance(n_items, int) and not isinstance(n_items, bool) and normalized_split == split
-        check("summary_metadata", "MISSING" if n_items is None or normalized_split is None else "PASS" if summary_metadata else "FAIL", f"n_items={n_items}, split={summary_split}")
-        run_metadata = kind != "MISSING" and run_metadata
-        ready = complete and coverage and protocol and bindings and summary_metadata and run_metadata
+        ready = manifest_valid and complete and coverage and protocol and bindings and summary_metadata and summary_values and run_metadata
         if ready:
             check("denominator", "PASS" if n_items == len(rows) else "FAIL", f"reported n_items={n_items}, actual denominator={len(rows)}")
             outcomes = []

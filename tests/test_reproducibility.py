@@ -123,6 +123,136 @@ def test_missing_per_item_results(sample: Path) -> None:
     assert report["aggregation"] == {}
 
 
+@pytest.mark.parametrize("label,relative", [("results", "results.jsonl"), ("summary", "eval_summary.json")])
+def test_missing_manifest_preserves_available_digest_failure(sample: Path, label: str, relative: str) -> None:
+    bind(sample)
+    (sample / "split_manifest.json").unlink()
+    with (sample / relative).open("a", encoding="utf-8") as stream:
+        stream.write("\n")
+    report = run(sample)
+    assert status(report, f"binding:{label}") == "FAIL"
+    assert report["status"] == "FAIL"
+    assert report["aggregation"].get("comparison_status") != "PASS"
+
+
+@pytest.mark.parametrize("contents", ["[]", "{broken"])
+def test_missing_results_still_validates_bound_summary(sample: Path, contents: str) -> None:
+    (sample / "eval_summary.json").write_text(contents, encoding="utf-8")
+    bind(sample)
+    (sample / "results.jsonl").unlink()
+    report = run(sample)
+    assert status(report, "binding:summary") == "PASS"
+    assert status(report, "summary") == "FAIL"
+    assert report["status"] == "FAIL"
+    assert report["aggregation"] == {}
+
+
+@pytest.mark.parametrize("field,value", [
+    ("hard", "0.5"), ("soft", True), ("n_items", "2"),
+    ("n_items", True), ("n_items", -1), ("split", []),
+])
+@pytest.mark.parametrize("results_mode", ["missing", "omitted", "empty"])
+def test_partial_results_do_not_hide_invalid_summary_fields(
+    sample: Path, field: str, value: object, results_mode: str,
+) -> None:
+    summary = {"split": "test", "n_items": 2, "hard": 0.5, "soft": 0.6, field: value}
+    write(sample / "eval_summary.json", summary)
+    if results_mode == "empty":
+        (sample / "results.jsonl").write_text("", encoding="utf-8")
+    bind(sample)
+    if results_mode == "missing":
+        (sample / "results.jsonl").unlink()
+    report = audit(
+        sample / "split_manifest.json", source_root=ROOT,
+        results_path=None if results_mode == "omitted" else sample / "results.jsonl",
+        summary_path=sample / "eval_summary.json", evidence_path=sample / "evidence.json",
+    )
+    assert status(report, "binding:summary") == "PASS"
+    check = f"summary_values:{field}" if field in {"hard", "soft"} else "summary_metadata"
+    assert status(report, check) == "FAIL"
+    assert report["status"] == "FAIL"
+    assert report["aggregation"].get("comparison_status") != "PASS"
+
+
+@pytest.mark.parametrize("field", ["hard", "soft", "n_items", "split"])
+def test_incomplete_summary_fields_remain_missing(sample: Path, field: str) -> None:
+    summary = {"split": "test", "n_items": 2, "hard": 0.5, "soft": 0.6}
+    summary[field] = None
+    write(sample / "eval_summary.json", summary)
+    bind(sample)
+    report = run(sample)
+    check = f"summary_values:{field}" if field in {"hard", "soft"} else "summary_metadata"
+    assert status(report, check) == "MISSING"
+    assert report["status"] == "MISSING"
+    assert report["aggregation"]["comparison_status"] == "MISSING"
+
+
+@pytest.mark.parametrize("target", ["split_manifest.json", "evidence.json", "train/items.json"])
+def test_malformed_artifact_does_not_skip_other_artifacts(sample: Path, target: str) -> None:
+    (sample / target).write_text("{broken", encoding="utf-8")
+    (sample / "results.jsonl").write_text("{broken", encoding="utf-8")
+    write(sample / "eval_summary.json", [])
+    report = run(sample)
+    label = {"split_manifest.json": "manifest", "evidence.json": "evidence", "train/items.json": "train"}[target]
+    assert status(report, label) == "FAIL"
+    assert status(report, "results") == "FAIL"
+    assert status(report, "summary") == "FAIL"
+    assert report["status"] == "FAIL"
+    assert "test" in report["split_counts"]
+
+
+def test_invalid_evidence_metadata_preserves_supplied_bindings(sample: Path) -> None:
+    bind(sample, classification="invalid")
+    with (sample / "results.jsonl").open("a", encoding="utf-8") as stream:
+        stream.write("\n")
+    report = run(sample)
+    assert status(report, "evidence") == "FAIL"
+    assert status(report, "binding:results") == "FAIL"
+    assert status(report, "summary_metadata") == "PASS"
+    assert report["aggregation"]["comparison_status"] == "MISSING"
+
+
+@pytest.mark.parametrize("target", ["split_manifest.json", "results.jsonl", "eval_summary.json"])
+def test_missing_artifact_preserves_valid_available_checks(sample: Path, target: str) -> None:
+    bind(sample)
+    (sample / target).unlink()
+    report = run(sample)
+    assert report["status"] == "MISSING"
+    assert not [check for check in report["checks"] if check["status"] == "FAIL"]
+    assert report["aggregation"].get("comparison_status") != "PASS"
+    assert status(report, "duplicates:test") == "PASS"
+    assert status(report, "binding:train") == "PASS"
+
+
+@pytest.mark.parametrize("case", ["missing_manifest", "missing_results", "only_missing"])
+def test_partial_input_cli_keeps_failures_and_input_bytes(
+    sample: Path, capsys: pytest.CaptureFixture, case: str,
+) -> None:
+    if case == "missing_results":
+        write(sample / "eval_summary.json", [])
+    bind(sample)
+    if case == "missing_manifest":
+        (sample / "split_manifest.json").unlink()
+        with (sample / "results.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write("\n")
+    else:
+        (sample / "results.jsonl").unlink()
+    before = {path: path.read_bytes() for path in sample.rglob("*") if path.is_file()}
+    args = [str(sample / "split_manifest.json"), "--results", str(sample / "results.jsonl"),
+            "--summary", str(sample / "eval_summary.json"), "--evidence", str(sample / "evidence.json")]
+    expected = "MISSING" if case == "only_missing" else "FAIL"
+    code = 2 if expected == "MISSING" else 1
+    assert main(args + ["--format", "json"]) == code
+    report = json.loads(capsys.readouterr().out)
+    assert report["status"] == expected
+    assert report["aggregation"].get("comparison_status") != "PASS"
+    names = [check["name"] for check in report["checks"]]
+    assert len(names) == len(set(names))
+    assert main(args) == code
+    assert f"Check status: {expected}" in capsys.readouterr().out
+    assert before == {path: path.read_bytes() for path in sample.rglob("*") if path.is_file()}
+
+
 @pytest.mark.parametrize("value,expected", [(66.7, "PASS"), (66.8, "FAIL")])
 def test_explicit_percentage_precision(sample: Path, value: float, expected: str) -> None:
     rows = [{"id": "a", "hard": 1 / 3, "soft": 1 / 3}, {"id": "b", "hard": 1, "soft": 1}]
